@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os 
+os.environ["TORCH_COMPILE_DEBUG"] = "1"
 import itertools
 from typing import Callable
 from unittest.mock import patch

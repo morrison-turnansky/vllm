@@ -1,0 +1,5 @@
+model: Qwen/Qwen3-0.6B-FP8
+max_num_seqs: 8
+max_seq_len: 512
+custom_ops:
+  - "+quant_fp8"
