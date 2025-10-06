@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # # import requests
 
 # # url = "http://localhost:8000/v1/completions"
@@ -15,7 +17,6 @@
 
 # # for i, item in enumerate(result["results"]):
 # #     print(f"Prompt {i+1} output:\n{item['text']}\n")
-
 
 # import requests
 # import time
@@ -42,8 +43,9 @@
 # print(f"Average latency per prompt: {total_time/len(prompts):.2f} s")
 # print(f"Throughput: {len(prompts)/total_time:.2f} prompts/sec")
 
-import requests
 import time
+
+import requests
 
 url = "http://localhost:8000/v1/completions"
 
@@ -53,11 +55,11 @@ for j in range(100):
         start = time.time()
         r = requests.post(url, json={"prompt": prompt, "max_tokens": 50})
         end = time.time()
-        
+
         resp = r.json()
         # vLLM includes "request_stats" if you enable it
         stats = resp.get("request_stats", {})
-        
+
         print(f"Prompt: {prompt}")
         print(f"Output tokens: {len(resp['choices'][0]['text'].split())}")
         print(f"Latency: {end-start:.3f}s")
