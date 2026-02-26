@@ -410,6 +410,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.use_direct_call = not current_platform.opaque_attention_op()
+        self.exposed_split = (
+            envs.VLLM_MLA_EXPOSED_SPLIT
+            and not self.use_direct_call
+            and self.attn_backend.accept_output_buffer
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -529,8 +534,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # torch.compile for better fusion opportunities on
             # surrounding GEMMs.
             if envs.VLLM_MLA_EXPOSED_SPLIT and self.attn_backend.accept_output_buffer:
+            if self.exposed_split:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-                return self.forward_exposed_split(q, kv_c_normed, k_pe, output)
+                # Exposed path still routes through forward_impl so there is a
+                # single entry point for MLA forward logic.
+                return self.forward_impl(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache=None,
+                    attn_metadata=None,
+                    output=output,
+                )
 
             # Default path: use unified MLA attention ops
             if self.attn_backend.accept_output_buffer:
@@ -559,8 +574,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
         kv_cache: torch.Tensor,
-        attn_metadata: "MLACommonMetadata",
-        output: torch.Tensor,
+        attn_metadata: "MLACommonMetadata | None",
+        output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -578,6 +593,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 dtype=q.dtype,
                 device=output.device,
             )
+
+        if self.exposed_split:
+            return self.forward_exposed_split(q, k_c_normed, k_pe, output)
+
+        assert kv_cache is not None
 
         if attn_metadata is None:
             # During the profile run try to simulate to worse case output size
@@ -684,6 +704,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
+                assert self.W_UK_T is not None
                 _, _, L = self.W_UK_T.shape
 
                 if self.q_pad_num_heads is not None:
@@ -955,9 +976,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return getattr(self.impl, "_run_prefill_new_tokens", None)
 
     def _forward_decode(self, *args, **kwargs):
-        return self.impl._forward_decode(  # type: ignore[attr-defined]
-            *args, **kwargs
-        )
+        # Older MLA implementations used _forward_decode; current backends
+        # expose forward_mqa. Support both during the refactor transition.
+        if hasattr(self.impl, "_forward_decode"):
+            return self.impl._forward_decode(  # type: ignore[attr-defined]
+                *args, **kwargs
+            )
+        return self.impl.forward_mqa(*args, **kwargs)
 
     def forward_exposed_split(
         self,
@@ -1005,9 +1030,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_nope = self.kv_b_proj(prefill_k_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-        k_nope, v = kv_nope.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k = self._concat_k_nope_k_pe(k_nope, prefill_k_pe)
 
         torch.ops.vllm.mla_attention_prefill_with_output(
@@ -1025,9 +1048,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
 
         # Convert from (B, N, P) to (N, B, P) for BMM
-        decode_q_nope = decode_q_nope.view(
-            -1, self.num_heads, self.qk_nope_head_dim
-        )
+        decode_q_nope = decode_q_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         decode_q_nope = decode_q_nope.transpose(0, 1)
 
         if self.is_aiter_triton_fp8_bmm_enabled:
@@ -1072,9 +1093,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if self.dcp_world_size > 1:
             assert not fp8_attention, "DCP not support fp8 kvcache now."
-            decode_q_final = get_dcp_group().all_gather(
-                decode_q_final, dim=1
-            )
+            decode_q_final = get_dcp_group().all_gather(decode_q_final, dim=1)
 
         attn_out, lse = torch.ops.vllm.mla_attention_decode(
             decode_q_final, dummy_tensor, self.layer_name
@@ -1085,15 +1104,56 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 attn_out,
                 lse,
                 get_dcp_group(),
-                is_lse_base_on_e=not getattr(
-                    self, "_use_fi_prefill", False
-                ),
+                is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
             )
 
         # v_up_proj BMM is visible to torch.compile for fusion
         self._v_up_proj(attn_out, out=decode_output)
 
         return output
+
+
+@maybe_transfer_kv_layer
+def _get_mla_context(
+    layer_name: str,
+) -> tuple["MLACommonMetadata", "MLAAttention", torch.Tensor]:
+    """Shared runtime context lookup for MLA custom ops."""
+    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    return attn_metadata, cast("MLAAttention", attn_layer), kv_cache
+
+
+@maybe_transfer_kv_layer
+def unified_mla_attention(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: str,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> torch.Tensor:
+    attn_metadata, layer, kv_cache = _get_mla_context(layer_name)
+    output = layer.forward_impl(q, kv_c_normed, k_pe, kv_cache, attn_metadata)
+
+    return output
+
+
+def unified_mla_attention_fake(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: str,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q).contiguous()
+
+
+direct_register_custom_op(
+    op_name="unified_mla_attention",
+    op_func=unified_mla_attention,
+    mutates_args=[],
+    fake_impl=unified_mla_attention_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
 
 def unified_mla_kv_cache_update(
     kv_c_normed: torch.Tensor,
@@ -1162,11 +1222,7 @@ def unified_mla_attention_with_output(
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
 ) -> None:
-    # kv_cache_dummy_dep is not used but accepting it creates a data dependency
-    # that ensures torch.compile preserves ordering between KV cache update and
-    # attention forward.
-    del kv_cache_dummy_dep
-    attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, layer, kv_cache = _get_mla_context(layer_name)
     layer.forward_impl(
         q,
         kv_c_normed,
@@ -1256,14 +1312,7 @@ def mla_write_kv_cache(
     data-dependent. Returns a dummy tensor to maintain dependency ordering
     for torch.compile.
     """
-    forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[layer_name]
-    attn_layer: MLAAttention = forward_context.no_compile_layers[layer_name]
-
-    # Get kv_cache from attn_layer
-    kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
+    attn_metadata, attn_layer, kv_cache = _get_mla_context(layer_name)
 
     if attn_metadata is None or kv_cache.numel() == 0:
         return kv_c_normed.sum().unsqueeze(0)
@@ -1316,13 +1365,7 @@ def mla_attention_decode(
     # Use dummy_tensor to establish ordering dependency (adds zero)
     _ = dummy_tensor.sum() * 0
 
-    forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[layer_name]
-    attn_layer: MLAAttention = forward_context.no_compile_layers[layer_name]
-
-    kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
+    attn_metadata, attn_layer, kv_cache = _get_mla_context(layer_name)
     if attn_layer.kv_cache_dtype.startswith("fp8"):
         kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -1332,12 +1375,8 @@ def mla_attention_decode(
         batch_size = 0
         num_heads = attn_layer.num_heads
         kv_lora_rank = attn_layer.kv_lora_rank
-        attn_out = decode_q.new_empty(
-            (batch_size, num_heads, kv_lora_rank)
-        )
-        lse = decode_q.new_empty(
-            (batch_size, num_heads), dtype=torch.float32
-        )
+        attn_out = decode_q.new_empty((batch_size, num_heads, kv_lora_rank))
+        lse = decode_q.new_empty((batch_size, num_heads), dtype=torch.float32)
         return attn_out, lse
 
     # Call the backend's decode attention
@@ -1412,13 +1451,7 @@ def mla_attention_prefill_with_output(
     # Use dummy_tensor to establish ordering dependency (adds zero)
     _ = dummy_tensor.sum() * 0
 
-    forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[layer_name]
-    attn_layer: MLAAttention = forward_context.no_compile_layers[layer_name]
-
-    kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
+    attn_metadata, attn_layer, kv_cache = _get_mla_context(layer_name)
     if attn_layer.kv_cache_dtype.startswith("fp8"):
         kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -1460,10 +1493,8 @@ def mla_attention_prefill_with_output(
                 )
             )
         else:
-            context_output, context_lse = (
-                attn_layer._compute_prefill_context(
-                    q, kv_cache, attn_metadata, attn_layer._k_scale
-                )
+            context_output, context_lse = attn_layer._compute_prefill_context(
+                q, kv_cache, attn_metadata, attn_layer._k_scale
             )
 
         # unpad if necessary
@@ -1471,9 +1502,7 @@ def mla_attention_prefill_with_output(
             context_output = context_output[..., : v.shape[-1]]
             suffix_output = suffix_output[..., : v.shape[-1]]
 
-        output_view = output.view(
-            -1, attn_layer.num_heads, attn_layer.v_head_dim
-        )
+        output_view = output.view(-1, attn_layer.num_heads, attn_layer.v_head_dim)
         merge_attn_states(
             output=output_view,
             prefix_output=context_output,
@@ -1483,9 +1512,7 @@ def mla_attention_prefill_with_output(
         )
     else:
         assert isinstance(output_prefill, torch.Tensor)
-        output_prefill = output_prefill[
-            ..., : v.shape[-1]
-        ].flatten(start_dim=-2)
+        output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
         output.copy_(output_prefill)
 
 
