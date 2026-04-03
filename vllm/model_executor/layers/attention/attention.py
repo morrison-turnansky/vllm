@@ -9,7 +9,11 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
@@ -555,6 +559,10 @@ def maybe_calc_kv_scales(
     value: torch.Tensor,
     layer_name: str,
 ) -> None:
+    # During profile run or graph compilation, forward_context may not be available
+    if not is_forward_context_available():
+        return
+
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
 
