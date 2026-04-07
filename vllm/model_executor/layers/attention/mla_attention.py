@@ -1009,17 +1009,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.layer_name,
         )
 
-        # Prefill path: kv_b_proj GEMM on full batch (CUDA-graph-safe)
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = self._concat_k_nope_k_pe(k_nope, k_pe)
-        # Prefill attention (cudagraph_unsafe): slices to prefill portion
+        # Prefill attention (cudagraph_unsafe): kv_b_proj runs inside the
+        # custom op on only the prefill tokens, avoiding wasted GEMM compute
+        # on decode tokens whose results would be discarded.
         prefill_result = torch.ops.vllm.mla_attention_prefill_with_output(
             q,
-            k,
-            v,
+            kv_c_normed,
+            k_pe,
             num_decode_tokens,
             dummy_tensor,
             self.layer_name,
@@ -1409,8 +1405,8 @@ direct_register_custom_op(
 
 def mla_attention_prefill_with_output(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
     num_decode_tokens: int,
     dummy_tensor: torch.Tensor,
     layer_name: str,
@@ -1422,14 +1418,25 @@ def mla_attention_prefill_with_output(
         kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
     q = q[num_decode_tokens:]
-    k = k[num_decode_tokens:]
-    v = v[num_decode_tokens:]
+    kv_c_normed = kv_c_normed[num_decode_tokens:]
+    k_pe = k_pe[num_decode_tokens:]
     num_prefill = q.shape[0]
-    out_dim = v.shape[-2] * v.shape[-1]
+    out_dim = attn_layer.num_heads * attn_layer.v_head_dim
     if attn_metadata is None or num_prefill == 0:
         return q.new_zeros(num_prefill, out_dim)
     if attn_metadata.prefill is None or attn_metadata.num_prefills == 0:
         return q.new_zeros(num_prefill, out_dim)
+
+    kv_nope = attn_layer.kv_b_proj(kv_c_normed)[0].view(
+        -1,
+        attn_layer.num_heads,
+        attn_layer.qk_nope_head_dim + attn_layer.v_head_dim,
+    )
+    k_nope, v = kv_nope.split(
+        [attn_layer.qk_nope_head_dim, attn_layer.v_head_dim], dim=-1
+    )
+    k = attn_layer._concat_k_nope_k_pe(k_nope, k_pe)
+
     assert attn_metadata.prefill is not None
     prefill_metadata = attn_metadata.prefill
     has_context = prefill_metadata.chunked_context is not None
@@ -1459,8 +1466,8 @@ def mla_attention_prefill_with_output(
                 q, kv_cache, attn_metadata, attn_layer._k_scale
             )
         if attn_layer._pad_v:
-            context_output = context_output[..., : v.shape[-1]]
-            suffix_output = suffix_output[..., : v.shape[-1]]
+            context_output = context_output[..., : attn_layer.v_head_dim]
+            suffix_output = suffix_output[..., : attn_layer.v_head_dim]
         result = q.new_empty(num_prefill, attn_layer.num_heads, attn_layer.v_head_dim)
         merge_attn_states(
             output=result,
@@ -1472,20 +1479,22 @@ def mla_attention_prefill_with_output(
         return result.flatten(start_dim=-2)
     else:
         assert isinstance(output_prefill, torch.Tensor)
-        return output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
+        return output_prefill[..., : attn_layer.v_head_dim].flatten(start_dim=-2)
 
 
 def mla_attention_prefill_with_output_fake(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
     num_decode_tokens: int,
     dummy_tensor: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile."""
+    forward_context = get_forward_context()
+    attn_layer = forward_context.no_compile_layers[layer_name]
     num_prefill = q.shape[0] - num_decode_tokens
-    out_dim = v.shape[-2] * v.shape[-1]
+    out_dim = attn_layer.num_heads * attn_layer.v_head_dim
     return q.new_empty(num_prefill, out_dim)
 
 
