@@ -515,28 +515,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
-            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-            self.forward_impl(
-                q,
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                attn_metadata,
-                output=output,
-            )
-            return output
+            if self.attn_backend.accept_output_buffer:
+                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                self.forward_impl(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    attn_metadata,
+                    output=output,
+                )
+                return output
+            else:
+                return self.forward_impl(
+                    q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+                )
         else:
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                self.layer_name,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
             # Exposed split path: exposes prefill/decode split to
             # torch.compile for better fusion opportunities on
             # surrounding GEMMs.
-            if envs.VLLM_MLA_EXPOSED_SPLIT and self.attn_backend.accept_output_buffer:
             if self.exposed_split:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 # Exposed path still routes through forward_impl so there is a
