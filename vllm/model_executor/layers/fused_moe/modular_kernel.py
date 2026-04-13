@@ -1144,7 +1144,10 @@ class FusedMoEKernelModularImpl:
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
-            dbo_maybe_run_recv_hook()
+            if envs.VLLM_MOE_DBO_UNWRAP:
+                torch.ops.vllm.dbo_maybe_run_recv_hook()
+            else:
+                dbo_maybe_run_recv_hook()
             prepare_ret = self.prepare_finalize.prepare_async(
                 hidden_states,
                 topk_weights,
@@ -1169,7 +1172,10 @@ class FusedMoEKernelModularImpl:
                     # context and call it in dbo_maybe_run_recv_hook instead of
                     #  passing it to the receiver.
                     dbo_register_recv_hook(hook)
-                    dbo_yield()
+                    if envs.VLLM_MOE_DBO_UNWRAP:
+                        torch.ops.vllm.dbo_yield()
+                    else:
+                        dbo_yield()
                 else:
                     hook()
 
@@ -1310,7 +1316,10 @@ class FusedMoEKernelModularImpl:
                     # context and call it in dbo_maybe_run_recv_hook instead of
                     #  passing it to the receiver.
                     dbo_register_recv_hook(hook)
-                    dbo_yield()
+                    if envs.VLLM_MOE_DBO_UNWRAP:
+                        torch.ops.vllm.dbo_yield()
+                    else:
+                        dbo_yield()
                 else:
                     hook()
 
