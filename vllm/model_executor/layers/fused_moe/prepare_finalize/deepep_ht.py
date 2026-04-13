@@ -5,6 +5,7 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -13,13 +14,16 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
     dbo_get_previous_event,
+    dbo_maybe_run_recv_hook,
     dbo_switch_to_comm,
     dbo_switch_to_compute,
     dbo_switch_to_compute_sync,
+    dbo_yield,
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
@@ -116,7 +120,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # We yield before launching the dispatch kernel since the dispatch
         # kernel will block the CPU so we want to queue up all the compute
         # for the other ubatch before the dispatch kernel starts.
-        dbo_yield_and_switch_from_compute_to_comm()
+        if envs.VLLM_MOE_DBO_UNWRAP:
+            torch.ops.vllm.dbo_yield_and_switch_from_compute_to_comm()
+        else:
+            dbo_yield_and_switch_from_compute_to_comm()
 
         (
             num_tokens_per_rank,
@@ -360,7 +367,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
         previous_event = dbo_get_previous_event(self.buffer.capture)
-        dbo_yield_and_switch_from_compute_to_comm()
+        if envs.VLLM_MOE_DBO_UNWRAP:
+            torch.ops.vllm.dbo_yield_and_switch_from_compute_to_comm()
+        else:
+            dbo_yield_and_switch_from_compute_to_comm()
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
@@ -388,7 +398,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
                 # TODO(lucas): refactor the modular kernel so this will be
                 # handled there
-                dbo_yield_and_switch_from_comm_to_compute()
+                if envs.VLLM_MOE_DBO_UNWRAP:
+                    torch.ops.vllm.dbo_yield_and_switch_from_comm_to_compute()
+                else:
+                    dbo_yield_and_switch_from_comm_to_compute()
 
             return _receiver
         else:
@@ -437,3 +450,64 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             weight_and_reduce_impl,
             False,
         )
+
+
+def dbo_maybe_run_recv_hook_impl() -> None:
+    dbo_maybe_run_recv_hook()
+
+
+def dbo_yield_impl() -> None:
+    dbo_yield()
+
+
+def dbo_yield_and_switch_from_compute_to_comm_impl() -> None:
+    dbo_yield_and_switch_from_compute_to_comm()
+
+
+def dbo_yield_and_switch_from_comm_to_compute_impl() -> None:
+    dbo_yield_and_switch_from_comm_to_compute()
+
+
+def dbo_maybe_run_recv_hook_fake() -> None:
+    pass
+
+
+def dbo_yield_fake() -> None:
+    pass
+
+
+def dbo_yield_and_switch_from_compute_to_comm_fake() -> None:
+    pass
+
+
+def dbo_yield_and_switch_from_comm_to_compute_fake() -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="dbo_maybe_run_recv_hook",
+    op_func=dbo_maybe_run_recv_hook_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
+
+direct_register_custom_op(
+    op_name="dbo_yield",
+    op_func=dbo_yield_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
+
+direct_register_custom_op(
+    op_name="dbo_yield_and_switch_from_compute_to_comm",
+    op_func=dbo_yield_and_switch_from_compute_to_comm_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
+
+direct_register_custom_op(
+    op_name="dbo_yield_and_switch_from_comm_to_compute",
+    op_func=dbo_yield_and_switch_from_comm_to_compute_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)

@@ -1135,6 +1135,15 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
+            if envs.VLLM_MOE_DBO_UNWRAP:
+                dbo_ops = [
+                    "vllm::dbo_maybe_run_recv_hook",
+                    "vllm::dbo_yield",
+                    "vllm::dbo_yield_and_switch_from_compute_to_comm",
+                    "vllm::dbo_yield_and_switch_from_comm_to_compute",
+                ]
+                self.splitting_ops.extend(dbo_ops)
+
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
         if (
             all2all_backend == "deepep_high_throughput"
