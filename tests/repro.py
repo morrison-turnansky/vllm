@@ -63,7 +63,7 @@ def test_dbo_custom_ops_registered():
     - Ops are registered regardless of VLLM_MOE_DBO_UNWRAP env var
     """
     # Import dbo_ops to trigger registration
-    import vllm.model_executor.layers.fused_moe.dbo_ops  # noqa: F401
+    import vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht  # noqa: F401
 
     # Verify ops are registered
     expected_ops = [
