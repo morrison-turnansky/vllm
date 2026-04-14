@@ -172,7 +172,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle
 
-        dbo_switch_to_compute_sync()
+        if envs.VLLM_MOE_DBO_UNWRAP:
+            torch.ops.vllm.dbo_switch_to_compute_sync()
+        else:
+            dbo_switch_to_compute_sync()
 
         return lambda: self._receiver(
             event,
@@ -385,14 +388,20 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             allocate_on_comm_stream=False,
         )
 
-        dbo_switch_to_compute()
+        if envs.VLLM_MOE_DBO_UNWRAP:
+            torch.ops.vllm.dbo_switch_to_compute()
+        else:
+            dbo_switch_to_compute()
 
         if do_async:
 
             def _receiver():
                 if event.event is not None:
                     event.current_stream_wait()
-                dbo_switch_to_comm()
+                if envs.VLLM_MOE_DBO_UNWRAP:
+                    torch.ops.vllm.dbo_switch_to_comm()
+                else:
+                    dbo_switch_to_comm()
                 # Respect inplace outputs.
                 output.copy_(combined_x, non_blocking=True)
 
@@ -467,6 +476,23 @@ def dbo_yield_and_switch_from_compute_to_comm_impl() -> None:
 def dbo_yield_and_switch_from_comm_to_compute_impl() -> None:
     dbo_yield_and_switch_from_comm_to_compute()
 
+def dbo_switch_to_compute_sync_impl() -> None:
+    dbo_switch_to_compute_sync()
+
+def dbo_switch_to_compute_impl() -> None:
+    dbo_switch_to_compute()
+
+def dbo_switch_to_comm_impl() -> None:
+    dbo_switch_to_comm()
+
+def dbo_switch_to_compute_sync_fake() -> None:
+    pass
+
+def dbo_switch_to_compute_fake() -> None:
+    pass
+
+def dbo_switch_to_comm_fake() -> None:
+    pass
 
 def dbo_maybe_run_recv_hook_fake() -> None:
     pass
@@ -483,6 +509,25 @@ def dbo_yield_and_switch_from_compute_to_comm_fake() -> None:
 def dbo_yield_and_switch_from_comm_to_compute_fake() -> None:
     pass
 
+direct_register_custom_op(
+    op_name="dbo_switch_to_compute_sync",
+    op_func=dbo_switch_to_compute_sync_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
+
+direct_register_custom_op(
+    op_name="dbo_switch_to_compute",
+    op_func=dbo_switch_to_compute_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
+direct_register_custom_op(
+    op_name="dbo_switch_to_comm",
+    op_func=dbo_switch_to_comm_impl,
+    dispatch_key="CompositeExplicitAutograd",
+    tags=(torch._C.Tag.cudagraph_unsafe,),
+)
 
 direct_register_custom_op(
     op_name="dbo_maybe_run_recv_hook",

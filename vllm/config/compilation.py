@@ -1141,6 +1141,9 @@ class CompilationConfig:
                     "vllm::dbo_yield",
                     "vllm::dbo_yield_and_switch_from_compute_to_comm",
                     "vllm::dbo_yield_and_switch_from_comm_to_compute",
+                    "vllm::dbo_switch_to_compute_sync",
+                    "vllm::dbo_switch_to_compute",
+                    "vllm::dbo_switch_to_comm",
                 ]
                 self.splitting_ops.extend(dbo_ops)
 

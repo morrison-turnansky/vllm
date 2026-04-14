@@ -71,6 +71,9 @@ def test_dbo_custom_ops_registered():
         "dbo_yield",
         "dbo_yield_and_switch_from_compute_to_comm",
         "dbo_yield_and_switch_from_comm_to_compute",
+        "dbo_switch_to_compute_sync",
+        "dbo_switch_to_compute",
+        "dbo_switch_to_comm",
     ]
 
     for op_name in expected_ops:
