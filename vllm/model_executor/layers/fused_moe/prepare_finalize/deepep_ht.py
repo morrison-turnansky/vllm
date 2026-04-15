@@ -476,23 +476,30 @@ def dbo_yield_and_switch_from_compute_to_comm_impl() -> None:
 def dbo_yield_and_switch_from_comm_to_compute_impl() -> None:
     dbo_yield_and_switch_from_comm_to_compute()
 
+
 def dbo_switch_to_compute_sync_impl() -> None:
     dbo_switch_to_compute_sync()
+
 
 def dbo_switch_to_compute_impl() -> None:
     dbo_switch_to_compute()
 
+
 def dbo_switch_to_comm_impl() -> None:
     dbo_switch_to_comm()
+
 
 def dbo_switch_to_compute_sync_fake() -> None:
     pass
 
+
 def dbo_switch_to_compute_fake() -> None:
     pass
 
+
 def dbo_switch_to_comm_fake() -> None:
     pass
+
 
 def dbo_maybe_run_recv_hook_fake() -> None:
     pass
@@ -508,6 +515,7 @@ def dbo_yield_and_switch_from_compute_to_comm_fake() -> None:
 
 def dbo_yield_and_switch_from_comm_to_compute_fake() -> None:
     pass
+
 
 direct_register_custom_op(
     op_name="dbo_switch_to_compute_sync",
