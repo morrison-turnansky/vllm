@@ -107,3 +107,198 @@ def test_dbo_dp_ep_gsm8k(all2all_backend: str, num_gpus_available):
             f"DBO+DP+EP accuracy too low ({all2all_backend}): "
             f"{accuracy:.3f} < {MIN_ACCURACY:.3f} "
         )
+
+
+def _make_unwrap_server_args(
+    all2all_backend: str,
+    *,
+    max_num_seqs: int = MAX_NUM_SEQS,
+    dbo_decode_threshold: int = 16,
+    dbo_prefill_threshold: int = 256,
+    enforce_eager: bool = False,
+) -> list[str]:
+    args = [
+        "--max-model-len",
+        "4096",
+        "--max-num-seqs",
+        str(max_num_seqs),
+        "--trust-remote-code",
+        "--data-parallel-size",
+        str(DP_SIZE),
+        "--enable-expert-parallel",
+        "--enable-dbo",
+        "--dbo-decode-token-threshold",
+        str(dbo_decode_threshold),
+        "--dbo-prefill-token-threshold",
+        str(dbo_prefill_threshold),
+        "--all2all-backend",
+        all2all_backend,
+    ]
+    if enforce_eager:
+        args.append("--enforce-eager")
+    return args
+
+
+@pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
+@pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
+@pytest.mark.xfail(
+    IS_BLACKWELL,
+    reason="Temporary: DBO accuracy unstable on Blackwell",
+)
+def test_dbo_unwrap_correctness(all2all_backend: str, num_gpus_available):
+    if num_gpus_available < DP_SIZE:
+        pytest.skip(f"Need at least {DP_SIZE} GPUs (DP={DP_SIZE})")
+
+    results = {}
+
+    for label, unwrap_enabled in [("wrapped", False), ("unwrapped", True)]:
+        server_args = _make_unwrap_server_args(all2all_backend)
+        env_dict = {"VLLM_MOE_DBO_UNWRAP": "1"} if unwrap_enabled else None
+
+        with RemoteOpenAIServer(
+            MODEL_NAME,
+            server_args,
+            max_wait_seconds=600,
+            env_dict=env_dict,
+        ) as remote_server:
+            host = f"http://{remote_server.host}"
+            port = remote_server.port
+
+            result = evaluate_gsm8k(
+                num_questions=NUM_QUESTIONS,
+                num_shots=NUM_SHOTS,
+                host=host,
+                port=port,
+            )
+            results[label] = result["accuracy"]
+
+    assert results["wrapped"] >= MIN_ACCURACY, (
+        f"Wrapped DBO accuracy too low ({all2all_backend}): "
+        f"{results['wrapped']:.3f} < {MIN_ACCURACY:.3f}"
+    )
+    assert results["unwrapped"] >= MIN_ACCURACY, (
+        f"Unwrapped DBO accuracy too low ({all2all_backend}): "
+        f"{results['unwrapped']:.3f} < {MIN_ACCURACY:.3f}"
+    )
+
+    accuracy_diff = abs(results["wrapped"] - results["unwrapped"])
+    assert accuracy_diff <= 0.05, (
+        f"Wrapped vs unwrapped accuracy diverged ({all2all_backend}): "
+        f"wrapped={results['wrapped']:.3f}, unwrapped={results['unwrapped']:.3f}, "
+        f"diff={accuracy_diff:.3f} > 0.05"
+    )
+
+
+@pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
+@pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
+@pytest.mark.xfail(
+    IS_BLACKWELL,
+    reason="Temporary: DBO accuracy unstable on Blackwell",
+)
+def test_dbo_compilation_eager(all2all_backend: str, num_gpus_available):
+    if num_gpus_available < DP_SIZE:
+        pytest.skip(f"Need at least {DP_SIZE} GPUs (DP={DP_SIZE})")
+
+    server_args = _make_unwrap_server_args(
+        all2all_backend,
+        enforce_eager=True,
+    )
+
+    with RemoteOpenAIServer(
+        MODEL_NAME,
+        server_args,
+        max_wait_seconds=600,
+        env_dict={"VLLM_MOE_DBO_UNWRAP": "1"},
+    ) as remote_server:
+        host = f"http://{remote_server.host}"
+        port = remote_server.port
+
+        result = evaluate_gsm8k(
+            num_questions=NUM_QUESTIONS,
+            num_shots=NUM_SHOTS,
+            host=host,
+            port=port,
+        )
+
+        accuracy = result["accuracy"]
+        assert accuracy >= MIN_ACCURACY, (
+            f"DBO unwrap eager mode accuracy too low ({all2all_backend}): "
+            f"{accuracy:.3f} < {MIN_ACCURACY:.3f}"
+        )
+
+
+@pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
+@pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
+@pytest.mark.xfail(
+    IS_BLACKWELL,
+    reason="Temporary: DBO accuracy unstable on Blackwell",
+)
+def test_dbo_microbatch_interleaving(all2all_backend: str, num_gpus_available):
+    if num_gpus_available < DP_SIZE:
+        pytest.skip(f"Need at least {DP_SIZE} GPUs (DP={DP_SIZE})")
+
+    server_args = _make_unwrap_server_args(
+        all2all_backend,
+        max_num_seqs=128,
+        dbo_decode_threshold=16,
+    )
+
+    with RemoteOpenAIServer(
+        MODEL_NAME,
+        server_args,
+        max_wait_seconds=600,
+        env_dict={"VLLM_MOE_DBO_UNWRAP": "1"},
+    ) as remote_server:
+        host = f"http://{remote_server.host}"
+        port = remote_server.port
+
+        result = evaluate_gsm8k(
+            num_questions=384,
+            num_shots=NUM_SHOTS,
+            host=host,
+            port=port,
+        )
+
+        accuracy = result["accuracy"]
+        assert accuracy >= MIN_ACCURACY, (
+            f"DBO micro-batch interleaving accuracy too low ({all2all_backend}): "
+            f"{accuracy:.3f} < {MIN_ACCURACY:.3f}"
+        )
+
+
+@pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
+@pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
+@pytest.mark.xfail(
+    IS_BLACKWELL,
+    reason="Temporary: DBO accuracy unstable on Blackwell",
+)
+def test_dbo_prefill_batch(all2all_backend: str, num_gpus_available):
+    if num_gpus_available < DP_SIZE:
+        pytest.skip(f"Need at least {DP_SIZE} GPUs (DP={DP_SIZE})")
+
+    server_args = _make_unwrap_server_args(
+        all2all_backend,
+        dbo_prefill_threshold=128,
+    )
+
+    with RemoteOpenAIServer(
+        MODEL_NAME,
+        server_args,
+        max_wait_seconds=600,
+        env_dict={"VLLM_MOE_DBO_UNWRAP": "1"},
+    ) as remote_server:
+        host = f"http://{remote_server.host}"
+        port = remote_server.port
+
+        result = evaluate_gsm8k(
+            num_questions=NUM_QUESTIONS,
+            num_shots=8,
+            host=host,
+            port=port,
+        )
+
+        accuracy = result["accuracy"]
+        assert accuracy >= MIN_ACCURACY, (
+            f"DBO prefill batch accuracy too low ({all2all_backend}): "
+            f"{accuracy:.3f} < {MIN_ACCURACY:.3f}"
+        )
