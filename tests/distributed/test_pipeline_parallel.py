@@ -211,7 +211,7 @@ def _compare_tp(
     test_options: PPTestOptions,
     num_gpus_available: int,
     *,
-    method: Literal["generate", "encode"],
+    method: Literal["generate_close", "encode"],
     is_multimodal: bool,
 ):
     (
@@ -368,7 +368,7 @@ def test_tp_language_generation(
         runner,
         test_options,
         num_gpus_available,
-        method="generate",
+        method="generate_close",
         is_multimodal=False,
     )
 
@@ -428,6 +428,6 @@ def test_tp_multimodal_generation(
         runner,
         test_options,
         num_gpus_available,
-        method="generate",
+        method="generate_close",
         is_multimodal=True,
     )
