@@ -30,7 +30,6 @@ from ....conftest import (
     VllmRunner,
 )
 from ....utils import create_new_process_for_each_test, large_gpu_mark, multi_gpu_marks
-from ...utils import check_outputs_equal
 from .vlm_utils import custom_inputs, model_utils, runners
 from .vlm_utils.case_filtering import get_parametrized_options
 from .vlm_utils.types import (
@@ -328,10 +327,6 @@ VLM_TEST_SETTINGS = {
         max_model_len=4096,
         max_num_seqs=2,
         auto_cls=AutoModelForImageTextToText,
-        # For chameleon, we only compare the sequences
-        vllm_output_post_proc=lambda vllm_output, model: vllm_output[:2],
-        hf_output_post_proc=lambda hf_output, model: hf_output[:2],
-        comparator=check_outputs_equal,
         max_tokens=8,
         dtype="bfloat16",
     ),
@@ -940,9 +935,6 @@ VLM_TEST_SETTINGS = {
         prompt_formatter=lambda img_prompt: f"USER: {img_prompt}\nASSISTANT:",
         max_model_len=4096,
         auto_cls=AutoModelForImageTextToText,
-        vllm_output_post_proc=lambda vllm_output, model: vllm_output[:2],
-        hf_output_post_proc=lambda hf_output, model: hf_output[:2],
-        comparator=check_outputs_equal,
         marks=multi_gpu_marks(num_gpus=2),
         **COMMON_BROADCAST_SETTINGS,  # type: ignore
     ),
