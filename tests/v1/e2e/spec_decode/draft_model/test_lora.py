@@ -67,6 +67,8 @@ def test_batch_inference_correctness(
         # Disable randomness
         if current_platform.is_cuda():
             m.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        m.setenv("VLLM_BATCH_INVARIANT", "1")
+        m.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         set_random_seed(SEED)
         m.setattr(torch.backends.cudnn, "benchmark", False)
         m.setattr(torch.backends.cudnn, "deterministic", True)
