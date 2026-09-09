@@ -21,6 +21,9 @@ from .registry import HF_EXAMPLE_MODELS
 
 TokensText = tuple[list[int], str]
 
+INPUT_LOGPROB_ATOL = 2e-2
+INPUT_LOGPROB_RTOL = 2e-2
+
 
 def check_outputs_equal(
     *,
@@ -50,6 +53,64 @@ def check_outputs_equal(
 
         assert output_str_0 == output_str_1, fail_msg
         assert output_ids_0 == output_ids_1, fail_msg
+
+
+def check_input_logprobs_close(
+    reference_logprobs: list[torch.Tensor],
+    reference_prompt_token_ids: list[list[int]],
+    candidate_prompt_token_ids: list[list[int]],
+    candidate_input_logprobs: list[list[float]],
+    *,
+    atol: float,
+    rtol: float,
+    name_0: str,
+    name_1: str,
+) -> None:
+    """Compare scores assigned to the fixed tokens in each prompt."""
+    assert len(reference_logprobs) == len(reference_prompt_token_ids)
+    assert len(candidate_prompt_token_ids) == len(reference_prompt_token_ids)
+    assert len(candidate_input_logprobs) == len(reference_prompt_token_ids)
+
+    for request_idx, (reference_ids, candidate_ids, candidate_scores) in enumerate(
+        zip(
+            reference_prompt_token_ids,
+            candidate_prompt_token_ids,
+            candidate_input_logprobs,
+        )
+    ):
+        id_failure = (
+            f"Input token IDs differ for request {request_idx}: "
+            f"{name_0}={reference_ids}, {name_1}={candidate_ids}"
+        )
+        assert reference_ids == candidate_ids, id_failure
+
+        expected_score_count = max(len(reference_ids) - 1, 0)
+        count_failure = (
+            f"Input logprob count differs for request {request_idx}: "
+            f"expected {expected_score_count} scores for {name_1}, "
+            f"got {len(candidate_scores)}"
+        )
+        assert len(candidate_scores) == expected_score_count, count_failure
+
+        for prompt_position in range(1, len(reference_ids)):
+            target_token_id = reference_ids[prompt_position]
+            reference_value = reference_logprobs[request_idx][
+                prompt_position - 1, target_token_id
+            ]
+            candidate_value = candidate_scores[prompt_position - 1]
+            reference_scalar = reference_value.item()
+            try:
+                torch.testing.assert_close(
+                    candidate_value, reference_scalar, atol=atol, rtol=rtol
+                )
+            except AssertionError as exc:
+                failure = (
+                    f"Input logprob mismatch for request {request_idx}, "
+                    f"prompt position {prompt_position}, target token "
+                    f"{target_token_id}: {name_1}={candidate_value}, "
+                    f"{name_0}={reference_scalar}"
+                )
+                raise AssertionError(failure) from exc
 
 
 # Representation of generated sequence as a tuple of
@@ -84,6 +145,14 @@ TokensTextLogprobsPromptLogprobs = tuple[
     list[int],
     str,
     list[dict[int, float]] | SampleLogprobs | None,
+    list[dict[int, float] | None] | PromptLogprobs | None,
+]
+
+TokensTextLogprobsPromptLogprobsWithTokenIds = tuple[
+    list[int],
+    str,
+    list[dict[int, float]] | SampleLogprobs | None,
+    list[int],
     list[dict[int, float] | None] | PromptLogprobs | None,
 ]
 

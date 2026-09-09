@@ -7,6 +7,7 @@ Run `pytest tests/basic_correctness/test_basic_correctness.py`.
 
 import os
 import weakref
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -20,7 +21,11 @@ from vllm.platforms import current_platform
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from ..conftest import VllmRunner
-from ..models.utils import check_logprobs_close
+from ..models.utils import (
+    INPUT_LOGPROB_ATOL,
+    INPUT_LOGPROB_RTOL,
+    check_input_logprobs_close,
+)
 from ..utils import multi_gpu_test
 
 ATTN_BACKEND = ["ROCM_ATTN"] if current_platform.is_rocm() else ["FLASH_ATTN"]
@@ -35,6 +40,59 @@ LEGACY_TARGET_TEST_SUITE_ENV = "TARGET_TEST_SUITE"
 
 GENERIC_DISTRIBUTED_TEST_SUITES = ("L4", "MI250", "MI300", "MI325", "MI355")
 ALL_DISTRIBUTED_TEST_SUITES = (*GENERIC_DISTRIBUTED_TEST_SUITES, "A100")
+
+
+def _get_vllm_input_logprobs(
+    vllm_model: VllmRunner,
+    prompts: list[str] | list[dict[str, Any]],
+    expected_prompt_token_ids: list[list[int]] | None,
+) -> tuple[list[list[int]], list[list[float]]]:
+    outputs = vllm_model.generate_greedy_logprobs(
+        prompts,
+        max_tokens=1,
+        num_logprobs=None,
+        num_prompt_logprobs=0,
+        include_prompt_token_ids=True,
+    )
+
+    if expected_prompt_token_ids is not None:
+        assert len(outputs) == len(expected_prompt_token_ids)
+    candidate_prompt_token_ids = []
+    candidate_input_logprobs = []
+    for request_idx, output in enumerate(outputs):
+        assert len(output) == 5, output
+        _, _, _, prompt_token_ids, prompt_logprobs = output
+        assert prompt_token_ids is not None
+        assert prompt_logprobs is not None
+        if expected_prompt_token_ids is not None:
+            assert prompt_token_ids == expected_prompt_token_ids[request_idx], (
+                f"Input token IDs differ for request {request_idx}: "
+                f"expected={expected_prompt_token_ids[request_idx]}, "
+                f"vllm={prompt_token_ids}"
+            )
+        assert prompt_token_ids
+        assert len(prompt_logprobs) == len(prompt_token_ids)
+        assert prompt_logprobs[0] is None
+
+        request_input_logprobs = []
+        for prompt_position, (token_id, token_logprobs) in enumerate(
+            zip(prompt_token_ids[1:], prompt_logprobs[1:]), start=1
+        ):
+            assert token_logprobs is not None, (
+                f"Missing vllm input logprob for request {request_idx}, "
+                f"prompt position {prompt_position}, target token {token_id}"
+            )
+            assert set(token_logprobs) == {token_id}, (
+                f"Unexpected vllm input logprobs for request {request_idx}, "
+                f"prompt position {prompt_position}, target token {token_id}: "
+                f"{token_logprobs}"
+            )
+            request_input_logprobs.append(token_logprobs[token_id].logprob)
+
+        candidate_prompt_token_ids.append(prompt_token_ids)
+        candidate_input_logprobs.append(request_input_logprobs)
+
+    return candidate_prompt_token_ids, candidate_input_logprobs
 
 
 def _default_target_test_suite() -> str:
@@ -100,7 +158,6 @@ def test_vllm_gc_ed():
 
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("backend", ATTN_BACKEND)
-@pytest.mark.parametrize("max_tokens", [5])
 @pytest.mark.parametrize("enforce_eager", [False])
 @pytest.mark.parametrize("async_scheduling", [True, False])
 @pytest.mark.parametrize("model_executor", ["uni", "mp"])
@@ -109,7 +166,6 @@ def test_models(
     hf_runner,
     model: str,
     backend: str,
-    max_tokens: int,
     enforce_eager: bool,
     async_scheduling: bool,
     model_executor: str,
@@ -124,15 +180,16 @@ def test_models(
         + " are:"
     )
     example_prompts = [prompt]
-    num_logprobs = 5
 
     with hf_runner(model) as hf_model:
-        hf_outputs = hf_model.generate_greedy_logprobs_limit(
-            example_prompts, max_tokens, num_logprobs
-        )
+        hf_inputs = hf_model.get_inputs(example_prompts)
+        reference_prompt_token_ids = [
+            inputs["input_ids"][0].tolist() for inputs in hf_inputs
+        ]
+        vllm_prompts: list[str] | list[dict[str, Any]]
         if enable_prompt_embeds:
             with torch.no_grad():
-                prompt_embeds = hf_model.get_prompt_embeddings(example_prompts)
+                prompt_embeds = hf_model.get_prompt_embeddings_from_inputs(hf_inputs)
             if model == "hmellor/tiny-random-Gemma2ForCausalLM" and (
                 Version(TRANSFORMERS_VERSION) < Version("5.3.0.dev0")
             ):
@@ -142,6 +199,21 @@ def test_models(
                 embed_scale = hf_model.config.hidden_size**0.5
                 normalizer = torch.tensor(embed_scale, dtype=prompt_embeds[0].dtype)
                 prompt_embeds = [p_e * normalizer for p_e in prompt_embeds]
+            reference_logprobs = hf_model.get_prompt_logprobs(
+                prompt_embeds=prompt_embeds
+            )
+            vllm_prompts = [
+                {
+                    "prompt_embeds": prompt_embed,
+                    "prompt_token_ids": prompt_token_ids,
+                }
+                for prompt_embed, prompt_token_ids in zip(
+                    prompt_embeds, reference_prompt_token_ids
+                )
+            ]
+        else:
+            reference_logprobs = hf_model.get_prompt_logprobs(hf_inputs)
+            vllm_prompts = example_prompts
 
     with VllmRunner(
         model,
@@ -153,20 +225,20 @@ def test_models(
         distributed_executor_backend=model_executor,
         attention_config={"backend": backend},
     ) as vllm_model:
-        if enable_prompt_embeds:
-            # Both HF (`generate_greedy_logprobs_limit`) and vLLM
-            # (`generate_greedy_logprobs`) return generated-only tokens.
-            vllm_outputs = vllm_model.generate_greedy_logprobs(
-                prompt_embeds, max_tokens, num_logprobs
-            )
-        else:
-            vllm_outputs = vllm_model.generate_greedy_logprobs(
-                example_prompts, max_tokens, num_logprobs
-            )
+        (
+            candidate_prompt_token_ids,
+            candidate_input_logprobs,
+        ) = _get_vllm_input_logprobs(
+            vllm_model, vllm_prompts, reference_prompt_token_ids
+        )
 
-    check_logprobs_close(
-        outputs_0_lst=hf_outputs,
-        outputs_1_lst=vllm_outputs,
+    check_input_logprobs_close(
+        reference_logprobs=reference_logprobs,
+        reference_prompt_token_ids=reference_prompt_token_ids,
+        candidate_prompt_token_ids=candidate_prompt_token_ids,
+        candidate_input_logprobs=candidate_input_logprobs,
+        atol=INPUT_LOGPROB_ATOL,
+        rtol=INPUT_LOGPROB_RTOL,
         name_0="hf",
         name_1="vllm",
     )
@@ -227,8 +299,6 @@ def test_models_distributed(
             monkeypatch_context.setenv(k, v)
 
         dtype = "half"
-        max_tokens = 5
-        num_logprobs = 5
 
         # NOTE: take care of the order. run vLLM first, and then run HF.
         # vLLM needs a fresh new process without cuda initialization.
@@ -247,29 +317,59 @@ def test_models_distributed(
         ) as vllm_model:
             if enable_prompt_embeds:
                 with hf_runner(model, dtype=dtype) as hf_model:
+                    hf_inputs = hf_model.get_inputs(example_prompts)
+                    reference_prompt_token_ids = [
+                        inputs["input_ids"][0].tolist() for inputs in hf_inputs
+                    ]
                     with torch.no_grad():
-                        prompt_embeds = hf_model.get_prompt_embeddings(example_prompts)
-                    # Both HF (`generate_greedy_logprobs_limit`) and vLLM
-                    # (`generate_greedy_logprobs`) return generated-only
-                    # tokens.
-                    vllm_outputs = vllm_model.generate_greedy_logprobs(
-                        prompt_embeds, max_tokens, num_logprobs
+                        prompt_embeds = hf_model.get_prompt_embeddings_from_inputs(
+                            hf_inputs
+                        )
+                    if model == "hmellor/tiny-random-Gemma2ForCausalLM" and (
+                        Version(TRANSFORMERS_VERSION) < Version("5.3.0.dev0")
+                    ):
+                        embed_scale = hf_model.config.hidden_size**0.5
+                        normalizer = torch.tensor(
+                            embed_scale, dtype=prompt_embeds[0].dtype
+                        )
+                        prompt_embeds = [p_e * normalizer for p_e in prompt_embeds]
+                    reference_logprobs = hf_model.get_prompt_logprobs(
+                        prompt_embeds=prompt_embeds
                     )
-                    hf_outputs = hf_model.generate_greedy_logprobs_limit(
-                        example_prompts, max_tokens, num_logprobs
+                    vllm_prompts = [
+                        {
+                            "prompt_embeds": prompt_embed,
+                            "prompt_token_ids": prompt_token_ids,
+                        }
+                        for prompt_embed, prompt_token_ids in zip(
+                            prompt_embeds, reference_prompt_token_ids
+                        )
+                    ]
+                    (
+                        candidate_prompt_token_ids,
+                        candidate_input_logprobs,
+                    ) = _get_vllm_input_logprobs(
+                        vllm_model, vllm_prompts, reference_prompt_token_ids
                     )
             else:
-                vllm_outputs = vllm_model.generate_greedy_logprobs(
-                    example_prompts, max_tokens, num_logprobs
-                )
+                (
+                    candidate_prompt_token_ids,
+                    candidate_input_logprobs,
+                ) = _get_vllm_input_logprobs(vllm_model, example_prompts, None)
                 with hf_runner(model, dtype=dtype) as hf_model:
-                    hf_outputs = hf_model.generate_greedy_logprobs_limit(
-                        example_prompts, max_tokens, num_logprobs
-                    )
+                    hf_inputs = hf_model.get_inputs(example_prompts)
+                    reference_prompt_token_ids = [
+                        inputs["input_ids"][0].tolist() for inputs in hf_inputs
+                    ]
+                    reference_logprobs = hf_model.get_prompt_logprobs(hf_inputs)
 
-    check_logprobs_close(
-        outputs_0_lst=hf_outputs,
-        outputs_1_lst=vllm_outputs,
+    check_input_logprobs_close(
+        reference_logprobs=reference_logprobs,
+        reference_prompt_token_ids=reference_prompt_token_ids,
+        candidate_prompt_token_ids=candidate_prompt_token_ids,
+        candidate_input_logprobs=candidate_input_logprobs,
+        atol=INPUT_LOGPROB_ATOL,
+        rtol=INPUT_LOGPROB_RTOL,
         name_0="hf",
         name_1="vllm",
     )
